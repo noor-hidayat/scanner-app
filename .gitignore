@@ -1,0 +1,8 @@
+node_modules/
+dist/
+scanner.db*
+*.xlsx
+.env
+certs/
+scanner.db-shm
+scanner.db-wal

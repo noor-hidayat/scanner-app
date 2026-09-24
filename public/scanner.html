@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Barcode Scanner</title>
+<link rel="manifest" href="/manifest.webmanifest" />
+<meta name="theme-color" content="#111111" />
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #111; color: #fff; }
+  header { padding: 12px 16px; text-align: center; font-weight: 700; letter-spacing: 1px; background: #000; }
+  .bar { display: flex; gap: 8px; align-items: center; padding: 10px 12px; background: #1a1a1a; }
+  .bar input { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #333; background: #222; color: #fff; font-size: 16px; }
+  .status { display: flex; align-items: center; gap: 6px; font-size: 13px; white-space: nowrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; }
+  .dot.on { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  #view { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; overflow: hidden; }
+  #view video { width: 100%; height: 100%; object-fit: cover; }
+  #frame { position: absolute; left: 10%; right: 10%; top: 30%; bottom: 30%; border: 2px solid #22c55e; border-radius: 8px; pointer-events: none; }
+  #flash { position: absolute; inset: 0; background: rgba(34,197,94,.35); opacity: 0; transition: opacity .15s; pointer-events: none; }
+  #flash.show { opacity: 1; }
+  #flash.err { background: rgba(239,68,68,.35); }
+  .actions { padding: 10px 12px; display: flex; gap: 8px; }
+  button { flex: 1; padding: 12px; border: 0; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  #btnCam { background: #2563eb; color: #fff; }
+  #btnStop { background: #333; color: #fff; }
+  .card { margin: 0 12px 12px; background: #1a1a1a; border-radius: 12px; padding: 12px; }
+  .last { font-size: 22px; font-weight: 700; word-break: break-all; }
+  .ok { color: #22c55e; } .err { color: #ef4444; } .warn { color: #f59e0b; }
+  #hist { list-style: none; margin: 8px 0 0; padding: 0; max-height: 220px; overflow: auto; font-size: 14px; }
+  #hist li { display: flex; justify-content: space-between; padding: 6px 0; border-top: 1px solid #2a2a2a; }
+  .manual { display: flex; gap: 8px; margin: 0 12px 12px; }
+  .manual input { flex: 1; padding: 12px; border-radius: 10px; border: 1px solid #333; background: #222; color: #fff; font-size: 16px; }
+  .manual button { flex: 0 0 auto; background: #22c55e; color: #000; padding: 12px 18px; }
+</style>
+</head>
+<body>
+<header>BARCODE SCANNER</header>
+<div class="bar">
+  <input id="scannerId" placeholder="Scanner ID (mis. HP-01)" />
+  <div class="status"><span id="dot" class="dot"></span><span id="conn">Disconnected</span></div>
+</div>
+<div id="view">
+  <video id="video" playsinline muted></video>
+  <div id="reader" style="width:100%;height:100%;display:none;"></div>
+  <div id="frame"></div>
+  <div id="flash"></div>
+</div>
+<div class="actions">
+  <button id="btnCam">Allow Camera &amp; Start</button>
+  <button id="btnStop">Stop</button>
+  <button id="btnReset" style="background:#dc2626;color:#fff;">Reset</button>
+</div>
+<div class="card">
+  <div style="font-size:12px;opacity:.7">Last Scan</div>
+  <div id="last" class="last">—</div>
+  <div id="msg" style="margin-top:4px;font-size:14px;">Siap scanning.</div>
+  <div style="margin-top:6px;font-size:14px;">Total Scan: <b id="total">0</b></div>
+  <ul id="hist"></ul>
+</div>
+<div class="manual">
+  <input id="manual" inputmode="numeric" placeholder="Ketik barcode manual…" />
+  <button id="btnSend">Kirim</button>
+</div>
+
+<script src="/barcode-detector-polyfill.js"></script>
+<script>
+// zxing-wasm: pakai wasm lokal agar work offline LAN tanpa CDN
+try {
+  const api = globalThis.BarcodeDetectionAPI;
+  if (api && api.setZXingModuleOverrides) {
+    api.setZXingModuleOverrides({ locateFile: (p, prefix) => p.endsWith('.wasm') ? '/zxing_reader.wasm' : (prefix||'')+p });
+  }
+} catch {}
+</script>
+<script src="/html5-qrcode.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const video = $('video'), dot = $('dot'), conn = $('conn'),
+  lastEl = $('last'), msgEl = $('msg'), totalEl = $('total'),
+  histEl = $('hist'), flash = $('flash');
+
+let scannerId = localStorage.getItem('scannerId') || 'HP-01';
+$('scannerId').value = scannerId;
+$('scannerId').addEventListener('change', (e) => {
+  scannerId = e.target.value.trim() || 'HP-01';
+  localStorage.setItem('scannerId', scannerId);
+  connectSocket();
+});
+
+let socket = null, connected = false;
+let total = 0;
+let lastSent = new Map(); // client-side debounce 800ms biar responsive
+const CLIENT_DEBOUNCE = 800;
+
+function setConn(on) {
+  connected = on;
+  dot.classList.toggle('on', on);
+  conn.textContent = on ? 'Connected' : 'Disconnected';
+  if (!on) showMsg('⚠ Server disconnected', 'warn');
+}
+
+function showMsg(t, cls) {
+  msgEl.textContent = t;
+  msgEl.className = cls || '';
+}
+
+function beep(ok = true) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = ok ? 880 : 220;
+    o.type = 'sine';
+    g.gain.setValueAtTime(0.2, ctx.currentTime);
+    o.start();
+    o.stop(ctx.currentTime + (ok ? 0.15 : 0.3));
+  } catch {}
+}
+
+function vibrate(ok) {
+  if (navigator.vibrate) navigator.vibrate(ok ? 80 : [80, 60, 80]);
+}
+
+function flashOk(ok) {
+  flash.classList.toggle('err', !ok);
+  flash.classList.add('show');
+  setTimeout(() => flash.classList.remove('show'), 180);
+}
+
+function pushHist(code, ok) {
+  const li = document.createElement('li');
+  li.innerHTML = `<span></span><b></b>`;
+  li.children[0].textContent = code;
+  li.children[1].textContent = ok ? '✓' : '✕';
+  li.children[1].className = ok ? 'ok' : 'err';
+  histEl.prepend(li);
+  while (histEl.children.length > 20) histEl.lastChild.remove();
+}
+
+async function sendBarcode(code) {
+  code = String(code || '').trim();
+  if (!code) return;
+  const now = Date.now();
+  const k = code;
+  if (lastSent.has(k) && now - lastSent.get(k) < CLIENT_DEBOUNCE) return; // cegah banjir frame
+  lastSent.set(k, now);
+
+  const payload = { barcode: code, scannerId };
+  // 1) coba WebSocket, 2) fallback REST
+  if (socket && connected) {
+    socket.emit('scanner:scan', payload);
+  } else {
+    try {
+      const r = await fetch('/api/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json();
+      onResult(code, r.ok, data.status === 'Ignored' ? 'Already scanned' : undefined);
+    } catch {
+      onResult(code, false, 'Connection lost');
+    }
+  }
+}
+
+function onResult(code, ok, note) {
+  if (ok) {
+    lastEl.textContent = code;
+    total += 1;
+    totalEl.textContent = total;
+    showMsg('✓ Scan successful ' + (note ? `(${note})` : ''), 'ok');
+    pushHist(code, true);
+  } else {
+    showMsg('✕ ' + (note || 'Scan failed'), 'err');
+    pushHist(code, false);
+  }
+  beep(ok); vibrate(ok); flashOk(ok);
+}
+
+function connectSocket() {
+  if (socket) socket.disconnect();
+  socket = io({ auth: { scannerId } });
+  socket.on('connect', () => { setConn(true); showMsg('Siap scanning.', ''); });
+  socket.on('disconnect', () => setConn(false));
+  socket.on('scanner:connect', () => setConn(true));
+  socket.on('server:scan', (data) => {
+    if (!data) return;
+    if (data.scan) {
+      // Abaikan broadcast milik scanner lain
+      if (data.scan.scanner_id && data.scan.scanner_id !== scannerId) return;
+      onResult(data.scan.barcode, true,
+        data.status === 'Ignored' ? 'Already scanned' : undefined);
+    }
+    else if (data.ok === false) onResult('', false, data.error);
+  });
+}
+connectSocket();
+
+// ---- Camera + decoding ----
+let stream = null, scanning = false, detector = null, html5Qr = null;
+
+$('btnCam').addEventListener('click', startCamera);
+$('btnStop').addEventListener('click', stopCamera);
+$('btnSend').addEventListener('click', () => {
+  const v = $('manual').value;
+  $('manual').value = '';
+  if (v.trim()) sendBarcode(v);
+});
+$('btnReset').addEventListener('click', async () => {
+  if (!confirm('Reset tampilan HP ini? (total ' + total + ' di HP, dashboard server tetap)')) return;
+  total = 0; totalEl.textContent = '0'; histEl.innerHTML = ''; lastEl.textContent = '—';
+  lastSent.clear();
+  showMsg('Tampilan HP direset (server tetap)', 'ok');
+});
+
+async function startCamera() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia && !window.Html5Qrcode) {
+      showMsg('Camera unavailable di browser ini. Gunakan input manual.', 'err');
+      return;
+    }
+
+    // Safari / iOS tidak punya BarcodeDetector -> pakai html5-qrcode (ZXing) fallback
+    const hasBarcodeDetector = 'BarcodeDetector' in window;
+    const hasHtml5Qrcode = typeof window.Html5Qrcode !== 'undefined';
+
+    if (!hasBarcodeDetector && hasHtml5Qrcode) {
+      video.style.display = 'none';
+      $('reader').style.display = 'block';
+      html5Qr = new window.Html5Qrcode("reader");
+      const config = { fps: 15, qrbox: { width: 280, height: 180 }, aspectRatio: 1.333 };
+      scanning = true;
+      showMsg('Kamera aktif (fallback Safari). Arahkan ke barcode.', '');
+      await html5Qr.start(
+        { facingMode: "environment" },
+        config,
+        (decodedText) => sendBarcode(decodedText),
+        () => {}
+      );
+      return;
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, audio: false,
+    });
+    video.style.display = '';
+    video.srcObject = stream;
+    await video.play();
+    showMsg('Kamera aktif. Arahkan ke barcode.', '');
+
+    if (hasBarcodeDetector) {
+      try {
+        const formats = await window.BarcodeDetector.getSupportedFormats?.() ?? [];
+        showMsg('Kamera aktif. Init detector ' + (formats.length?formats.slice(0,3).join(','):'default') + '...', '');
+        detector = new window.BarcodeDetector({
+          formats: formats.length ? formats : ['qr_code','ean_13','ean_8','code_128','code_39','upc_a','upc_e','itf'],
+        });
+      } catch (e) { console.warn('BarcodeDetector ctor fail', e); try { detector = new window.BarcodeDetector(); } catch(e2){ console.error(e2); } }
+      if (!detector) {
+        showMsg('Detector gagal init, fallback ke html5-qrcode...', 'warn');
+        // fallback ke html5-qrcode jika detector gagal
+        if (hasHtml5Qrcode) {
+          await stopCamera();
+          video.style.display = 'none';
+          $('reader').style.display = 'block';
+          html5Qr = new window.Html5Qrcode("reader");
+          scanning = true;
+          await html5Qr.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 150 } }, (t)=>sendBarcode(t), ()=>{});
+          showMsg('Kamera aktif (html5-qrcode). Arahkan ke barcode.', '');
+          return;
+        }
+      } else {
+        scanning = true;
+        // warmup zxing-wasm (polyfill) - fetch wasm 953KB butuh 1-2 detik di Safari
+        showMsg('Detector siap, mulai scan...', 'ok');
+        // test wasm load sekali, jika gagal fallback
+        try { await detector.detect(video).catch(()=>[]); } catch {}
+        loopDetect();
+      }
+    } else {
+      showMsg('Browser tidak mendukung BarcodeDetector. Gunakan input manual / Chrome Android.', 'warn');
+    }
+  } catch (e) {
+    console.error(e);
+    showMsg('Camera access is required to scan barcode. Coba https://<IP>:3443/scanner dan allow camera.', 'err');
+  }
+}
+
+async function stopCamera() {
+  scanning = false;
+  if (html5Qr) {
+    try { await html5Qr.stop(); html5Qr.clear(); } catch {}
+    html5Qr = null;
+    $('reader').style.display = 'none';
+    video.style.display = '';
+  }
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  video.srcObject = null;
+  detector = null;
+}
+
+let noDetectCount = 0;
+async function loopDetect() {
+  if (!scanning) return;
+  try {
+    // Safari kadang readyState 2/3 sudah cukup, jangan tunggu 4
+    if (detector && video.readyState >= 2 && video.videoWidth > 0) {
+      const codes = await detector.detect(video);
+      if (codes && codes.length) {
+        const val = codes[0].rawValue;
+        if (val) { noDetectCount = 0; sendBarcode(val); await new Promise((r) => setTimeout(r, 200)); }
+      } else {
+        noDetectCount++;
+        // jika 80 frame (~10 detik) tidak ada hasil, kemungkinan wasm tidak load / format tidak cocok -> fallback html5-qrcode
+        if (noDetectCount > 80 && typeof window.Html5Qrcode !== 'undefined' && !html5Qr) {
+          console.warn('No barcode 10s, fallback html5-qrcode');
+          showMsg('Coba fallback html5-qrcode...', 'warn');
+          try {
+            scanning = false;
+            if (stream) { stream.getTracks().forEach((t)=>t.stop()); }
+            video.style.display = 'none';
+            $('reader').style.display = 'block';
+            html5Qr = new window.Html5Qrcode("reader");
+            scanning = true;
+            await html5Qr.start({ facingMode: "environment" }, { fps: 15, qrbox: { width: 280, height: 180 } }, (t)=>sendBarcode(t), ()=>{});
+            showMsg('Fallback aktif. Arahkan ke barcode.', 'ok');
+            return;
+          } catch(e){ console.error('fallback fail', e); scanning = true; }
+        }
+      }
+    } else if (detector) {
+      // debug: video belum siap
+      // showMsg('Video siap: '+video.readyState+' '+video.videoWidth+'x'+video.videoHeight, '');
+    }
+  } catch (e) {
+    console.warn('detect err', e);
+    const msg = (e && e.message) ? e.message : String(e);
+    showMsg('Detect error: '+ msg, 'err');
+    // zxing-wasm service unavailable -> langsung fallback ke html5-qrcode (client decode)
+    if (msg.includes('service unavailable') || msg.includes('NotSupportedError')) {
+      if (typeof window.Html5Qrcode !== 'undefined' && !html5Qr) {
+        showMsg('WASM gagal, fallback html5-qrcode (zxing)...', 'warn');
+        try {
+          scanning = false;
+          if (stream) stream.getTracks().forEach((t)=>t.stop());
+          stream = null;
+          video.style.display = 'none';
+          $('reader').style.display = 'block';
+          html5Qr = new window.Html5Qrcode("reader");
+          scanning = true;
+          await html5Qr.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 150 } }, (t)=>sendBarcode(t), ()=>{});
+          showMsg('Fallback html5-qrcode aktif. Arahkan ke barcode.', 'ok');
+          return;
+        } catch(fe){ console.error('fallback fail', fe); showMsg('Fallback gagal: '+fe.message, 'err'); scanning = true; }
+      } else {
+        showMsg('Coba refresh dan pastikan https://'+location.host+'/zxing_reader.wasm bisa diakses', 'err');
+      }
+    }
+  }
+  if (scanning) requestAnimationFrame(() => setTimeout(loopDetect, 60));
+}
+
+// PWA
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+</script>
+</body>
+</html>

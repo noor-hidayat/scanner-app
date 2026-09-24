@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Wireless Barcode Scanner — Dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #f4f4f5; color: #18181b; }
+  header { background: #111; color: #fff; padding: 14px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  header h1 { font-size: 18px; margin: 0; }
+  .pill { font-size: 13px; background: #22c55e; color: #000; padding: 4px 12px; border-radius: 999px; font-weight: 700; }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .card { background: #fff; border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { margin: 0 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: .5px; opacity: .6; }
+  .big { font-size: 28px; font-weight: 800; }
+  .row { display: flex; justify-content: space-between; padding: 6px 0; border-top: 1px solid #eee; font-size: 14px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+  .on { background: #22c55e; } .off { background: #ccc; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+  input, select { padding: 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+  button { padding: 10px 16px; border: 0; border-radius: 8px; font-weight: 700; cursor: pointer; background: #111; color: #fff; }
+  button.export { background: #16a34a; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; }
+  th { font-size: 12px; text-transform: uppercase; opacity: .6; }
+  .qr { font-size: 13px; background: #fef9c3; border: 1px solid #fde047; padding: 10px 12px; border-radius: 10px; }
+  .qr code { font-weight: 700; }
+  @media (max-width: 600px) { table { font-size: 12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Wireless Barcode Scanner</h1>
+  <span class="pill" id="srvStatus">● Running</span>
+</header>
+<main>
+  <div class="qr" id="qrBox">Buka scanner di HP: <code id="scanUrl"></code> &nbsp;|&nbsp; <a href="/scanner">/scanner</a></div>
+  <div class="grid">
+    <div class="card"><h2>Total Scan</h2><div class="big" id="total">0</div></div>
+    <div class="card"><h2>Connected Scanner</h2><div class="big" id="connCount">0</div></div>
+    <div class="card"><h2>Debounce</h2><div class="big" id="debounce">2s</div></div>
+  </div>
+  <div class="card">
+    <h2>Connected Scanner</h2>
+    <div id="scanners"><div style="opacity:.5;font-size:14px;">Belum ada scanner terhubung.</div></div>
+  </div>
+  <div class="card">
+    <h2>Recent Scans</h2>
+    <div class="toolbar" style="margin-bottom:10px;">
+      <input id="fScanner" placeholder="Filter scanner (HP-01)" />
+      <input id="fQ" placeholder="Cari barcode…" />
+      <button id="btnFilter">Filter</button>
+      <button class="export" id="btnExport">Export Excel</button>
+    </div>
+    <div style="overflow:auto;">
+    <table>
+      <thead><tr><th>Time</th><th>Scanner</th><th>Barcode</th><th>Status</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    </div>
+  </div>
+</main>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+$('scanUrl').textContent = location.origin + '/scanner';
+
+async function loadScans() {
+  const s = $('fScanner').value.trim(), q = $('fQ').value.trim();
+  const p = new URLSearchParams({ limit: '100' });
+  if (s) p.set('scanner', s);
+  if (q) p.set('q', q);
+  const r = await fetch('/api/scans?' + p);
+  const data = await r.json();
+  renderRows(data.scans || []);
+  $('total').textContent = data.total ?? $('total').textContent;
+}
+function renderRows(scans) {
+  $('rows').innerHTML = scans.map((s) =>
+    `<tr><td>${new Date(s.scanned_at).toLocaleTimeString()}</td><td>${esc(s.scanner_id)}</td><td><b>${esc(s.barcode)}</b></td><td>${esc(s.status)}</td></tr>`
+  ).join('') || '<tr><td colspan="4" style="opacity:.5">Belum ada scan.</td></tr>';
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function loadScanners() {
+  const r = await fetch('/api/scanners');
+  const data = await r.json();
+  renderScanners(data.scanners || []);
+  $('total').textContent = data.totalScans ?? $('total').textContent;
+  if (data.debounceMs) $('debounce').textContent = (data.debounceMs / 1000) + 's';
+}
+function renderScanners(list) {
+  const on = list.filter((s) => s.connected);
+  $('connCount').textContent = on.length;
+  $('scanners').innerHTML = list.length ? list.map((s) =>
+    `<div class="row"><span><span class="dot ${s.connected ? 'on' : 'off'}"></span><b>${esc(s.scannerId)}</b> — ${esc(s.lastScan ?? '—')}</span><span>${s.totalScan} scan</span></div>`
+  ).join('') : '<div style="opacity:.5;font-size:14px;">Belum ada scanner terhubung.</div>';
+}
+
+$('btnFilter').addEventListener('click', loadScans);
+$('btnExport').addEventListener('click', () => { location.href = '/api/scans/export'; });
+
+const socket = io();
+socket.on('server:scan', () => loadScans().then(loadScanners));
+socket.on('server:status', (d) => {
+  if (d.scanners) renderScanners(d.scanners);
+  if (typeof d.totalScans === 'number') $('total').textContent = d.totalScans;
+});
+socket.on('connect', () => { $('srvStatus').textContent = '● Running'; });
+socket.on('disconnect', () => { $('srvStatus').textContent = '○ Disconnected'; });
+
+loadScans(); loadScanners();
+</script>
+</body>
+</html>
